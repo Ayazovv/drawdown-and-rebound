@@ -1,7 +1,4 @@
 streamlit
+yfinance
 pandas
-numpy
-xgboost
-ccxt
-asyncio
-scikit-learn
+plotly
