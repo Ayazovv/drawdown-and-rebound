@@ -11,19 +11,16 @@ import yfinance as yf
 import pandas as pd
 import plotly.graph_objects as go
 
-# Sayfa Ayarları
 st.set_page_config(page_title="Rebound & Drawdown Tarayıcı", page_icon="🎯", layout="wide")
 
-# --- YARDIMCI FONKSİYONLAR ---
-@st.cache_data(ttl=300) # Veriyi hızlı yüklemek için 5 dakika önbellekte tutar
+@st.cache_data(ttl=300)
 def fetch_data(ticker, period, interval):
     df = yf.download(ticker, period=period, interval=interval, progress=False)
-    # yfinance çoklu index düzeltmesi
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.droplevel(1)
     return df
 
-def find_unclosed_levels(df, window=2):
+def find_unclosed_levels(df, wick_ratio=1.5):
     if df.empty:
         return None, None, None
 
@@ -31,24 +28,27 @@ def find_unclosed_levels(df, window=2):
     unclosed_bottoms = []
     unclosed_tops = []
     
-    # Tüm veri setinde gezinerek tepe ve dipleri bul
-    for i in range(window, len(df) - window):
-        is_bottom = True
-        is_top = True
+    # Tüm veri setinde gezinerek uzun fitilli mumları bul
+    for i in range(1, len(df) - 1):
+        open_p = float(df['Open'].iloc[i])
+        close_p = float(df['Close'].iloc[i])
+        high_p = float(df['High'].iloc[i])
+        low_p = float(df['Low'].iloc[i])
         
-        # Lokal Dip ve Tepe kontrolü
-        for j in range(1, window + 1):
-            if df['Low'].iloc[i] >= df['Low'].iloc[i - j] or df['Low'].iloc[i] >= df['Low'].iloc[i + j]:
-                is_bottom = False
-            if df['High'].iloc[i] <= df['High'].iloc[i - j] or df['High'].iloc[i] <= df['High'].iloc[i + j]:
-                is_top = False
-                
-        # KAPANMAMIŞ DİP KONTROLÜ
-        if is_bottom:
-            level = float(df['Low'].iloc[i])
-            future_min = float(df['Low'].iloc[i+1:].min())
+        body = abs(open_p - close_p)
+        body = body if body > 0 else 0.0001 # Sıfıra bölme hatasını engelle
+        
+        lower_wick = min(open_p, close_p) - low_p
+        upper_wick = high_p - max(open_p, close_p)
+        
+        # --- REBOUND (DİP) KONTROLÜ ---
+        # Alt fitil gövdeden belirgin şekilde büyükse ve üst fitilden uzunsa
+        if lower_wick >= body * wick_ratio and lower_wick > upper_wick:
+            level = min(open_p, close_p) # Çizgiyi gövdenin en altına koy
             
-            if future_min > level:  # Fiyat bu dibin altına hiç inmemiş
+            # Bu seviyenin altına gelecekte 'kapanış' gelmiş mi?
+            future_closes = df['Close'].iloc[i+1:]
+            if not future_closes.empty and float(future_closes.min()) >= level:
                 dist_pts = current_price - level
                 dist_pct = (dist_pts / current_price) * 100
                 unclosed_bottoms.append({
@@ -58,12 +58,14 @@ def find_unclosed_levels(df, window=2):
                     'Uzaklık (%)': round(dist_pct, 2)
                 })
                 
-        # KAPANMAMIŞ TEPE KONTROLÜ
-        if is_top:
-            level = float(df['High'].iloc[i])
-            future_max = float(df['High'].iloc[i+1:].max())
+        # --- DRAWDOWN (TEPE) KONTROLÜ ---
+        # Üst fitil gövdeden belirgin şekilde büyükse ve alt fitilden uzunsa
+        if upper_wick >= body * wick_ratio and upper_wick > lower_wick:
+            level = max(open_p, close_p) # Çizgiyi gövdenin en üstüne koy
             
-            if future_max < level:  # Fiyat bu tepenin üstüne hiç çıkmamış
+            # Bu seviyenin üstüne gelecekte 'kapanış' gelmiş mi?
+            future_closes = df['Close'].iloc[i+1:]
+            if not future_closes.empty and float(future_closes.max()) <= level:
                 dist_pts = level - current_price
                 dist_pct = (dist_pts / current_price) * 100
                 unclosed_tops.append({
@@ -79,11 +81,10 @@ def find_unclosed_levels(df, window=2):
     
     return current_price, unclosed_tops, unclosed_bottoms
 
-# --- ARAYÜZ (UI) ---
+# --- ARAYÜZ ---
 st.title("🎯 Saf Fiyat Hareketi: Rebound & Drawdown Tarayıcı")
-st.markdown("Bu araç, fiyatın bir daha geri dönmediği **kapanmamış dipleri (Rebound Potansiyeli)** ve **kapanmamış tepeleri (Drawdown Potansiyeli)** tespit eder.")
+st.markdown("Fitil (gölge) uzunluklarına dayalı saf fiyat hareketi analizi.")
 
-# Sol Menü (Sidebar)
 st.sidebar.header("⚙️ Tarama Ayarları")
 symbols = {
     'NASDAQ Futures (NQ=F)': 'NQ=F',
@@ -94,22 +95,21 @@ symbols = {
 selected_name = st.sidebar.selectbox("Enstrüman Seç", list(symbols.keys()))
 ticker = symbols[selected_name]
 
-period = st.sidebar.selectbox("Geçmiş Periyot", ["5d", "1mo", "3mo", "6mo", "1y"], index=1, help="Ne kadar geriye gidilecek?")
-interval = st.sidebar.selectbox("Zaman Dilimi (Mum Tipi)", ["5m", "15m", "1h", "4h", "1d"], index=2)
-window = st.sidebar.slider("Hassasiyet (Sağ/Sol Mum Sayısı)", min_value=1, max_value=10, value=2, help="Değer ne kadar yüksekse, sadece o kadar büyük tepeler/dipler alınır.")
+period = st.sidebar.selectbox("Geçmiş Periyot", ["5d", "1mo", "3mo", "6mo", "1y"], index=1)
+interval = st.sidebar.selectbox("Zaman Dilimi", ["5m", "15m", "1h", "4h", "1d"], index=2)
+wick_ratio = st.sidebar.slider("Fitil/Gövde Oranı", min_value=1.0, max_value=5.0, value=2.0, step=0.1, help="Fitil, gövdeden kaç kat uzun olmalı?")
 
 if st.sidebar.button("Analizi Başlat 🚀", type="primary", use_container_width=True):
     with st.spinner(f"{selected_name} için veriler işleniyor..."):
         df = fetch_data(ticker, period, interval)
         
         if df.empty:
-            st.error("Seçilen periyot/zaman dilimi kombinasyonu için veri bulunamadı! Lütfen ayarları değiştirin.")
+            st.error("Veri bulunamadı!")
         else:
-            current_price, tops, bottoms = find_unclosed_levels(df, window)
+            current_price, tops, bottoms = find_unclosed_levels(df, wick_ratio)
             
             st.metric(label=f"💰 Anlık Fiyat ({selected_name})", value=f"{current_price:.2f}")
             
-            # Tablolar
             col1, col2 = st.columns(2)
             
             with col1:
@@ -117,16 +117,15 @@ if st.sidebar.button("Analizi Başlat 🚀", type="primary", use_container_width
                 if tops:
                     st.dataframe(pd.DataFrame(tops).set_index('Tarih'), use_container_width=True)
                 else:
-                    st.info("Bu periyotta kapanmamış tepe bulunamadı.")
+                    st.info("Kriterlere uygun tepe bulunamadı.")
                     
             with col2:
                 st.subheader("🟢 Kapanmamış Dipler (Rebound)")
                 if bottoms:
                     st.dataframe(pd.DataFrame(bottoms).set_index('Tarih'), use_container_width=True)
                 else:
-                    st.info("Bu periyotta kapanmamış dip bulunamadı.")
+                    st.info("Kriterlere uygun dip bulunamadı.")
             
-            # Grafik Çizimi (Plotly)
             st.markdown("---")
             st.subheader("📈 Grafik Üzerinde İnceleme")
             
@@ -135,13 +134,11 @@ if st.sidebar.button("Analizi Başlat 🚀", type="primary", use_container_width
                             low=df['Low'], close=df['Close'],
                             name="Fiyat")])
             
-            # Tepeleri Grafiğe Kırmızı Kesikli Çizgi Olarak Ekle
             if tops:
                 for t in tops:
                     fig.add_hline(y=t['Seviye'], line_dash="dash", line_color="rgba(255, 0, 0, 0.6)", 
                                   annotation_text=f"{t['Seviye']:.2f}", annotation_position="top right")
             
-            # Dipleri Grafiğe Yeşil Kesikli Çizgi Olarak Ekle
             if bottoms:
                 for b in bottoms:
                     fig.add_hline(y=b['Seviye'], line_dash="dash", line_color="rgba(0, 255, 0, 0.6)", 
